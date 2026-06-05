@@ -37,6 +37,14 @@ MAX_JOBS=180
 MAX_UNUSED="${MAX_UNUSED:-unlimited}"
 MAX_REPACK_SIZE="${MAX_REPACK_SIZE:-}"
 
+# Retry handling. restic's local backend over an rclone/s3fs mount can intermittently fail on
+# lock files (e.g. "unable to refresh lock: chmod ...: no such file or directory") when the
+# mount's directory cache briefly surfaces a lock object that is already gone on the remote, or
+# after a killed run. Rather than fail the whole target, retry the operation, clearing locks in
+# between. RETRIES = additional attempts after the first; RETRY_DELAY = seconds between them.
+RETRIES="${RETRIES:-2}"
+RETRY_DELAY="${RETRY_DELAY:-15}"
+
 RUN=false
 FORGET=false
 PRUNE=false
@@ -60,6 +68,8 @@ usage() {
     echo "Environment overrides:"
     echo "  MAX_UNUSED        Prune --max-unused value (default: unlimited = no repack, fastest)"
     echo "  MAX_REPACK_SIZE   Prune --max-repack-size value (default: unset = no cap)"
+    echo "  RETRIES           Extra attempts per target after the first (default: 2)"
+    echo "  RETRY_DELAY       Seconds between attempts, with an unlock in between (default: 15)"
     echo "  ALLOW_ROOT_FS=1   Bypass the destination mount-point safety check"
     exit 1
 }
@@ -174,6 +184,36 @@ ensure_repo() {
     "${RESTIC}" init --repo "${REPO}" --password-file "${PASS_FILE}" > "${LOG}/${SFX}_${USER}-init.log" 2>&1
 }
 
+# Run a restic command with retries, clearing locks between attempts. This absorbs transient
+# lock-file errors seen on rclone/s3fs mounts (stale dir-cache entries, killed-run leftovers).
+# --repo and --password-file are appended automatically.
+# Usage: retry_restic <repo> <logfile> -- <restic args...>
+retry_restic() {
+    local repo="$1"
+    local logfile="$2"
+    shift 2
+    [ "$1" = "--" ] && shift
+
+    local attempt=1
+    local max=$((RETRIES + 1))
+
+    while :; do
+        if "${RESTIC}" "$@" --repo "${repo}" --password-file "${PASS_FILE}" > "${logfile}" 2>&1; then
+            return 0
+        fi
+
+        if [ "${attempt}" -ge "${max}" ]; then
+            return 1
+        fi
+
+        echo "  retry ${attempt}/${RETRIES} for repo ${repo} after failure (see ${logfile}); unlocking and waiting ${RETRY_DELAY}s"
+        # Clear stale/phantom locks before the next attempt.
+        "${RESTIC}" unlock --repo "${repo}" --password-file "${PASS_FILE}" > /dev/null 2>&1
+        sleep "${RETRY_DELAY}"
+        attempt=$((attempt + 1))
+    done
+}
+
 backup_user() {
     local USER="$1"
     local TS=$(date +%Y%m%d-%H%M%S)
@@ -195,7 +235,7 @@ backup_user() {
     # instance of this script is running against the same destination.
     "${RESTIC}" unlock --repo "${REPO}" --password-file "${PASS_FILE}" > /dev/null 2>&1
 
-    if ! "${RESTIC}" backup --repo "${REPO}" --password-file "${PASS_FILE}" --tag "${TAG}" "./${USER}" ${RESTIC_OPTS} > "${LOG}/${SFX}_${USER}-backup.log" 2>&1; then
+    if ! retry_restic "${REPO}" "${LOG}/${SFX}_${USER}-backup.log" -- backup --tag "${TAG}" "./${USER}" ${RESTIC_OPTS}; then
         echo "Backup failed for ${SFX} : ${USER}. Check ${LOG}/${SFX}_${USER}-backup.log"
         record_failure "${USER} (backup)"
         return 1
@@ -222,7 +262,7 @@ forget_user() {
     # Remove stale locks only (safe under flock; see note in backup_user).
     "${RESTIC}" unlock --repo "${REPO}" --password-file "${PASS_FILE}" > /dev/null 2>&1
 
-    if ! "${RESTIC}" forget --repo "${REPO}" --password-file "${PASS_FILE}" ${FORGET_OPTS} > "${LOG}/${SFX}_${USER}-forget.log" 2>&1; then
+    if ! retry_restic "${REPO}" "${LOG}/${SFX}_${USER}-forget.log" -- forget ${FORGET_OPTS}; then
         echo "Forget failed for ${SFX} : ${USER}. Check ${LOG}/${SFX}_${USER}-forget.log"
         record_failure "${USER} (forget)"
         return 1
@@ -255,7 +295,7 @@ prune_user() {
     # Remove stale locks only (safe under flock; see note in backup_user).
     "${RESTIC}" unlock --repo "${REPO}" --password-file "${PASS_FILE}" > /dev/null 2>&1
 
-    if ! "${RESTIC}" prune --repo "${REPO}" --password-file "${PASS_FILE}" ${PRUNE_OPTS} > "${LOG}/${SFX}_${USER}-prune.log" 2>&1; then
+    if ! retry_restic "${REPO}" "${LOG}/${SFX}_${USER}-prune.log" -- prune ${PRUNE_OPTS}; then
         echo "Prune failed for ${SFX} : ${USER}. Check ${LOG}/${SFX}_${USER}-prune.log"
         record_failure "${USER} (prune)"
         return 1

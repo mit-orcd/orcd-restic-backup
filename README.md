@@ -125,6 +125,8 @@ environment variables (defaults shown):
 | `MAX_JOBS`     | `180`                        | edit script    | Max parallel per-user jobs. Tuned to saturate the backup host.     |
 | `MAX_UNUSED`   | `unlimited`                  | `MAX_UNUSED`   | Prune `--max-unused`. `unlimited` = no repacking (fast/cheap).     |
 | `MAX_REPACK_SIZE` | _(unset)_                 | `MAX_REPACK_SIZE` | Prune `--max-repack-size`; caps repack volume per run when set. |
+| `RETRIES`      | `2`                          | `RETRIES`      | Extra attempts per target after the first (unlock between tries).  |
+| `RETRY_DELAY`  | `15`                         | `RETRY_DELAY`  | Seconds to wait between attempts.                                  |
 | `TMP`          | `/db/temp`                   | `TMP`          | Working dir for logs, lock files, and the failure log.             |
 | `PASS_FILE`    | `$HOME/.backup_pass`         | `PASS_FILE`    | restic password file used for all repos.                           |
 | `RESTIC`       | `/usr/local/bin/restic`      | `RESTIC`       | Path to the restic binary.                                         |
@@ -208,6 +210,13 @@ fully utilize a dedicated backup server handling thousands of targets.
 - **Failure tracking (`#3`):** Background jobs cannot easily propagate exit codes, so each
   failed target appends a line to a per-run failure log. At the end the script prints a
   summary and exits non-zero if anything failed, so monitoring sees real status.
+- **Retry with unlock:** Each per-user restic operation runs through a retry wrapper
+  (`RETRIES` attempts, `RETRY_DELAY` seconds apart, with `restic unlock` between tries). This
+  absorbs the transient lock-file errors that can occur when the repository lives on an
+  rclone/s3fs FUSE mount — e.g. `unable to refresh lock: chmod ...: no such file or
+  directory`, caused by the mount's directory cache briefly surfacing a lock object that is
+  already deleted on the remote, or leftovers from a killed run. A target is only counted as
+  failed after all attempts are exhausted.
 
 ## Logs and exit codes
 
@@ -273,6 +282,15 @@ restic -r /mnt/backup_pool/pool005/<user> --password-file /root/.backup_pass res
   large repos, use `MAX_REPACK_SIZE` to bound per-run work so prune fits your maintenance
   window.
 - All repositories under a destination share one password file.
+- **rclone/s3fs mount + lock errors:** When the destination is an rclone (or s3fs) FUSE mount
+  of object storage (e.g. Wasabi), restic's local backend can intermittently fail on lock
+  files (`unable to refresh lock: chmod ...: no such file or directory`). This is caused by
+  the mount's directory cache surfacing a lock object that is already gone on the remote (or
+  leftovers from a killed run), not by repository corruption. The script's retry-with-unlock
+  wrapper absorbs these. To reduce them at the source, keep the mount's directory cache short
+  — for an rclone mount, add mount options such as
+  `dir_cache_time=5s,attr_timeout=1s,poll_interval=10s` (the default `dir_cache_time` is 5
+  minutes, which is the main culprit).
 - Per-user logs are overwritten each run; capture cron output (or copy logs) if you need
   history for diagnosing intermittent failures.
 - `--compression` requires repositories in format v2; `--skip-if-unchanged` requires a
