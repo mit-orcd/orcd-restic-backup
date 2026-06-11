@@ -1,297 +1,194 @@
-# orcd-restic-backup
+# orcd-restic
 
-A Bash wrapper around [restic](https://restic.net/) for backing up a large pool of
-per-user directories on a dedicated backup server. Each user directory under a source
-pool is backed up into its own restic repository, with backups fanned out in parallel to
-saturate the backup host. Retention/pruning is a separate mode so it can run on its own
-schedule.
+Parallel, per-user [restic](https://restic.net/) backups of large multi-user
+filesystems to Wasabi S3 buckets.
 
-## Overview
+Each top-level directory under the source (typically one per user) is backed up
+into its **own restic repository** inside the bucket, so users can be backed up,
+expired, pruned, and restored independently and in parallel.
 
-For a given `SOURCE` pool (e.g. `/data2/pool/005`), the script:
+```text
+SOURCE                    BUCKET (Wasabi)
+/home/alice      ->       s3://orcd-backup-home/home3/alice    (restic repo)
+/home/bob        ->       s3://orcd-backup-home/home3/bob      (restic repo)
+/home/carol      ->       s3://orcd-backup-home/home3/carol    (restic repo)
+```
 
-1. Discovers every immediate subdirectory (one per user), excluding any named `restore*`,
-   in sorted order.
-2. For each user, targets a dedicated restic repository at `DESTINATION/<user>`.
-3. Runs the chosen operation(s) — `backup`, `forget` (retention policy), and/or `prune`
-   (data reclamation) — across all users in parallel, throttled to `MAX_JOBS` concurrent
-   jobs.
-4. Reports a per-run summary and exits non-zero if any target failed.
+## Scripts
 
-`forget` and `prune` are intentionally separate modes. `forget` only removes snapshot
-references (cheap, metadata-only) and is safe to run frequently. `prune` is what physically
-reclaims data and, on remote/object storage, is the slow/expensive step — so it runs on its
-own (infrequent) schedule and is tuned to stay safe for very large repositories.
+| Script | Backend | Status |
+| --- | --- | --- |
+| `restic_backup_s3.sh` | restic native S3 backend, talks directly to Wasabi | **recommended** |
+| `restic_backup.sh` | restic local backend over an rclone VFS mount | legacy |
 
-Each source pool maps to one destination root, and the two are processed independently of
-other pools. The script is designed to be driven from `cron`.
+### Why the native S3 backend?
+
+restic's *local* backend writes every pack file under a temporary name
+(`data/xx/<hash>-tmp-<n>`) and then renames it. S3 has no rename, so an rclone
+mount emulates it as server-side `COPY` + `DELETE`. The result: **every uploaded
+pack also produces one deleted object of the same size** (~17 MB each in
+practice). On Wasabi, objects deleted before the minimum storage period are
+billed as *timed deleted storage* — in our case this silently accumulated tens
+of TB of "deleted storage" charges. The native S3 backend uploads each object
+once under its final key: no rename, no `COPY`, no `DELETE`, and none of the VFS
+dir-cache lock flakiness of the mount.
 
 ## Requirements
 
-- **OS:** Linux. The script relies on GNU `find` (`-printf`), GNU `stat` (`stat -c`), and
-  `flock` (util-linux). It is not portable to macOS/BSD as-is.
-- **restic:** Installed at `/usr/local/bin/restic` by default (override with `RESTIC`).
-  A reasonably recent version is required for `--compression` (repo format v2) and
-  `--skip-if-unchanged`.
-- **Bash:** 4.3+ (uses `wait -n`).
-- A restic repository password file (see [Configuration](#configuration)).
+- bash >= 4.3, `flock`, GNU `find`
+- restic >= 0.17 (`--retry-lock`, `--skip-if-unchanged`)
+- rclone (only to verify the in-bucket root dir, and for the legacy script's mount)
+- Wasabi credentials in `/root/.config/rclone/rclone.conf`, e.g.:
 
-## Installation
-
-Place the script somewhere on the backup server and make it executable:
-
-```bash
-install -m 0755 restic_backup.sh /root/bin/restic_backup.sh
+```ini
+[wasabi]
+type = s3
+provider = Wasabi
+access_key_id = ...
+secret_access_key = ...
+endpoint = s3.us-east-1.wasabisys.com
 ```
 
-Create the password file used to encrypt/open every repository:
-
-```bash
-umask 077
-printf '%s' 'your-restic-repo-password' > /root/.backup_pass
-```
-
-> All per-user repositories under a destination share the **same** password file.
+`restic_backup_s3.sh` reads the keys and endpoint from this file (single source
+of truth); no separate AWS config is needed.
 
 ## Usage
 
 ```text
-Usage: restic_backup.sh [options]
-Options:
-  -z <level>                  Set compression level (auto|off|fastest|better|max, default: auto)
-  -s|--source <dir>           Set source directory to backup (default: /data2/pool/005)
-  -d|--destination <dir>      Set destination root dir to backup (default: /mnt/backup_pool/pool005)
+restic_backup_s3.sh [options]
+
+  -z <level>                  Compression level (auto|off|fastest|better|max, default: auto)
+  -s|--source <dir>           Source directory containing per-user dirs
+  -b|--bucket <bucket[/pfx]>  Destination bucket (default: orcd-backup-home)
+  -R|--root-dir <dir>         REQUIRED root dir inside the bucket (e.g. home3);
+                              must already exist unless ALLOW_NEW_ROOT=1
+  -u|--user <name>            Run for this user only (repeatable: -u alice -u bob)
+  -n|--no-flock               Bypass the global lock (requires -u); takes per-user locks
   -r|--run                    Execute the backup
-  -f|--forget                 Apply retention policy only (remove snapshots, NO prune)
-  -p|--prune                  Reclaim data (prune); safe for large repos, run monthly
-
-  -r, -f and -p may be combined; at least one is required.
-  Order when combined: backup -> forget -> prune.
-
-Environment overrides:
-  MAX_UNUSED        Prune --max-unused value (default: unlimited = no repack, fastest)
-  MAX_REPACK_SIZE   Prune --max-repack-size value (default: unset = no cap)
-  ALLOW_ROOT_FS=1   Bypass the destination mount-point safety check
+  -f|--forget                 Apply retention policy (snapshots only, no data reclaim)
+  -p|--prune                  Reclaim unreferenced data (expensive; run monthly)
 ```
 
-At least one of `-r`, `-f`, or `-p` must be given, otherwise usage is printed and the script
-exits with status `1`. When more than one is given they always run in the order
-backup → forget → prune.
+`-r`, `-f`, `-p` may be combined; order is always backup → forget → prune.
 
 ### Examples
 
-Run a backup of a pool:
-
 ```bash
-/root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -r
+# Nightly: backup + retention for all users
+restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r -f
+
+# Monthly: reclaim space (respect Wasabi minimum storage period)
+restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -p
+
+# Ad hoc, one user only
+restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -u alice -r -f
+
+# Ad hoc while the scheduled full run is in progress
+restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -u alice -n -r
+
+# First-ever run against a new root dir
+ALLOW_NEW_ROOT=1 restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
 ```
 
-Backup and apply retention policy (recommended nightly job — no data reclamation):
-
-```bash
-/root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -r -f
-```
-
-Reclaim data (recommended monthly job; default skips repacking for speed/safety):
-
-```bash
-/root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -p
-```
-
-Prune while capping repack volume per run (chip away incrementally over several runs):
-
-```bash
-MAX_REPACK_SIZE=50G /root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -p
-```
-
-Override compression for one run:
-
-```bash
-/root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -r -z max
-```
-
-## Configuration
-
-The following defaults are set at the top of the script. Several can be overridden via
-environment variables (defaults shown):
-
-| Setting        | Default                      | Env override   | Description                                                        |
-| -------------- | ---------------------------- | -------------- | ------------------------------------------------------------------ |
-| `SOURCE`       | `/data2/pool/005`            | `-s` flag      | Pool whose immediate subdirectories (users) are backed up.         |
-| `DESTINATION`  | `/mnt/backup_pool/pool005`   | `-d` flag      | Root under which per-user repos (`DESTINATION/<user>`) live.        |
-| `COMPRESSION`  | `auto`                       | `-z` flag      | restic compression level (`auto`/`off`/`fastest`/`better`/`max`).  |
-| `KEEP_DAILY`   | `14`                         | edit script    | Daily snapshots kept by `forget`.                                  |
-| `KEEP_WEEKLY`  | `2`                          | edit script    | Weekly snapshots kept by `forget`.                                 |
-| `MAX_JOBS`     | `180`                        | edit script    | Max parallel per-user jobs. Tuned to saturate the backup host.     |
-| `MAX_UNUSED`   | `unlimited`                  | `MAX_UNUSED`   | Prune `--max-unused`. `unlimited` = no repacking (fast/cheap).     |
-| `MAX_REPACK_SIZE` | _(unset)_                 | `MAX_REPACK_SIZE` | Prune `--max-repack-size`; caps repack volume per run when set. |
-| `RETRIES`      | `2`                          | `RETRIES`      | Extra attempts per target after the first (unlock between tries).  |
-| `RETRY_DELAY`  | `15`                         | `RETRY_DELAY`  | Seconds to wait between attempts.                                  |
-| `TMP`          | `/db/temp`                   | `TMP`          | Working dir for logs, lock files, and the failure log.             |
-| `PASS_FILE`    | `$HOME/.backup_pass`         | `PASS_FILE`    | restic password file used for all repos.                           |
-| `RESTIC`       | `/usr/local/bin/restic`      | `RESTIC`       | Path to the restic binary.                                         |
-| `ALLOW_ROOT_FS`| `0`                          | `ALLOW_ROOT_FS`| Set to `1` to bypass the destination mount-point safety check.     |
-
-> Retention (`KEEP_DAILY`/`KEEP_WEEKLY`) and `MAX_JOBS` are not exposed as flags; edit the
-> script to change them.
-
-## How it works
-
-### Per-user repositories
-
-Users are discovered (sorted) with:
-
-```bash
-find -L "$SOURCE" -maxdepth 1 -mindepth 1 -type d ! -name "restore*" -printf '%f\n' | sort
-```
-
-For each user, the repository is `DESTINATION/<user>`. On backup, the repo is created on
-first use (`restic init`) if it does not already exist (detected via `restic cat config`).
-
-### Backup mode (`-r`)
-
-For each user the script:
-
-1. `cd`s into `SOURCE` and backs up the relative path `./<user>`.
-2. Ensures the repo exists (init if missing).
-3. Removes stale locks (`restic unlock`).
-4. Runs `restic backup --tag backup-<timestamp> --compression <level> --verbose --skip-if-unchanged`.
-
-Backup mode does **not** forget or prune.
-
-### Forget mode (`-f`)
-
-Applies the retention policy for each existing repo — removes snapshots only, **no data
-reclamation**:
-
-```bash
-restic forget --keep-daily 14 --keep-weekly 2
-```
-
-This is metadata-only and cheap, so it is safe to run on every backup. Missing repositories
-are skipped.
-
-### Prune mode (`-p`)
-
-Physically reclaims data no longer referenced by any snapshot, for each existing repo:
-
-```bash
-restic prune --max-unused unlimited [--max-repack-size <MAX_REPACK_SIZE>]
-```
-
-This is the expensive operation on remote/object storage, because repacking partially-used
-pack files requires downloading and re-uploading data. To keep it safe for very large
-repositories:
-
-- **`--max-unused unlimited` (default)** skips repacking entirely — restic only deletes pack
-  files that are 100% unreferenced. This minimizes time and bandwidth; space is reclaimed
-  **lazily** as packs become fully unused over successive runs. Set `MAX_UNUSED=0` (or e.g.
-  `5%`) if you instead want aggressive repacking to minimize stored size.
-- **`MAX_REPACK_SIZE`** (optional) caps how much data a single run will repack, so you can
-  chip away incrementally across multiple runs rather than risk a run that won't finish.
-
-Prune is intended to run on its own, infrequent schedule. Missing repositories are skipped.
-
-### Parallelism
-
-All targets are processed by a shared runner that launches background jobs and throttles to
-`MAX_JOBS` concurrent jobs using `wait -n`. The default of `180` is intentionally high to
-fully utilize a dedicated backup server handling thousands of targets.
-
-## Safety features
-
-- **Mount check (`#1`):** Before any writes, the script resolves the mount point of
-  `DESTINATION` (`stat -c '%m'`). If it resolves to `/`, the backup volume is presumed not
-  mounted and the run aborts to avoid silently filling the root disk. Override with
-  `ALLOW_ROOT_FS=1`.
-- **Single-instance lock (`#2`):** A per-destination `flock` (`$TMP/.restic_backup.<sfx>.lock`)
-  prevents two runs against the same destination pool from overlapping and corrupting
-  repositories. Different pools (different destinations) can still run concurrently.
-- **Failure tracking (`#3`):** Background jobs cannot easily propagate exit codes, so each
-  failed target appends a line to a per-run failure log. At the end the script prints a
-  summary and exits non-zero if anything failed, so monitoring sees real status.
-- **Retry with unlock:** Each per-user restic operation runs through a retry wrapper
-  (`RETRIES` attempts, `RETRY_DELAY` seconds apart, with `restic unlock` between tries). This
-  absorbs the transient lock-file errors that can occur when the repository lives on an
-  rclone/s3fs FUSE mount — e.g. `unable to refresh lock: chmod ...: no such file or
-  directory`, caused by the mount's directory cache briefly surfacing a lock object that is
-  already deleted on the remote, or leftovers from a killed run. A target is only counted as
-  failed after all attempts are exhausted.
-
-## Logs and exit codes
-
-- Per-user logs are written under `$TMP/log/` (default `/db/temp/log/`):
-  - `<sfx>_<user>-init.log` — repository initialization output.
-  - `<sfx>_<user>-backup.log` — backup output.
-  - `<sfx>_<user>-forget.log` — forget (retention policy) output.
-  - `<sfx>_<user>-prune.log` — prune (data reclamation) output.
-
-  where `<sfx>` is the last path component of `DESTINATION` (e.g. `pool005`). Logs are
-  overwritten on each run.
-
-- **Exit codes:**
-  - `0` — all operations completed successfully.
-  - `1` — usage error, another run already in progress, destination not mounted, or one or
-    more targets failed (a summary of failed targets is printed).
-
-## Scheduling
-
-Because backup, forget, and prune are independent modes, the recommended pattern is frequent
-backups with retention applied each run, and infrequent data reclamation. Example `crontab`
-(run as `root`):
+### Suggested cron schedule
 
 ```cron
-# Nightly backup + retention policy at 01:00 (cheap; no data reclamation)
-0 1 1-30 * *  /root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -r -f
-
-# Monthly prune on the 1st at 04:00 (data reclamation)
-0 4 1 * *     /root/bin/restic_backup.sh -s /data2/pool/005 -d /mnt/backup_pool/pool005 -p
+# nightly backup + forget at 04:00
+0 4 * * *  /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r -f >> /var/log/restic_backup.log 2>&1
+# monthly prune, 1st of the month at 12:00
+0 12 1 * * /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -p   >> /var/log/restic_prune.log  2>&1
 ```
 
-The single-instance lock makes overlapping invocations safe to schedule — a second run
-against the same destination will exit immediately rather than run concurrently.
+## Environment overrides
 
-### Why prune runs monthly
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_JOBS` | `90` | Parallel per-user jobs |
+| `PACK_SIZE` | `64` | `--pack-size` (MiB); larger packs = fewer objects on Wasabi |
+| `RETRY_LOCK` | `5m` | restic `--retry-lock`: wait for competing repo locks |
+| `RETRIES` / `RETRY_DELAY` | `2` / `15` | Extra attempts per target / seconds between them |
+| `MAX_UNUSED` | `unlimited` | Prune `--max-unused` (`unlimited` = never repack, fastest) |
+| `MAX_REPACK_SIZE` | unset | Prune `--max-repack-size` cap per run |
+| `S3_CONNECTIONS` | `5` | restic `-o s3.connections` per process |
+| `S3_ENDPOINT` | from rclone.conf | Wasabi endpoint URL |
+| `RCLONE_CONF` | `/root/.config/rclone/rclone.conf` | Where keys/endpoint are read from |
+| `RCLONE_REMOTE` | `wasabi` | rclone.conf section to read |
+| `RESTIC_CACHE_DIR` | derived | restic metadata cache (see below) |
+| `PASS_FILE` | `~/.backup_pass` | restic repository password file |
+| `TMP` | `/db/temp` | Lock files, failure log, per-user logs (`$TMP/log/`) |
+| `ALLOW_NEW_ROOT` | `0` | `1` = skip the root-dir-exists check (first run) |
 
-If your object-storage backend enforces a minimum storage duration (e.g. Wasabi's 30-day
-minimum), data deleted before that period is still billed for the full minimum. Pruning more
-often than the minimum yields no storage savings and triggers early-deletion charges plus
-repack churn. Running `prune` roughly every 30 days — at or beyond the storage minimum —
-aligns physical deletion with the billing floor. Meanwhile `forget` (run nightly) keeps the
-snapshot list reflecting the retention policy continuously.
+### Cache directory convention
 
-## Restoring
+The restic metadata cache is derived from the bucket name —
+`orcd-backup-<x>` → `/stage/backup/<x>/001/restic-cache`:
 
-Each user has a standalone restic repository, so restores use restic directly. For example:
+| Bucket | Cache dir |
+| --- | --- |
+| `orcd-backup-home` | `/stage/backup/home/001/restic-cache` |
+| `orcd-backup-software` | `/stage/backup/software/001/restic-cache` |
+| `orcd-backup-pool` | `/stage/backup/pool/001/restic-cache` |
+
+## Safety mechanisms
+
+1. **Root-dir check** — refuses to run if `-R <dir>` contains no objects in the
+   bucket, so a typo cannot silently start a brand-new tree and re-upload
+   everything (`ALLOW_NEW_ROOT=1` overrides for genuine first runs).
+2. **Single-instance lock** — one `flock` per bucket+root prevents overlapping
+   full runs. `-n` (with `-u`) downgrades it to per-user locks for ad hoc runs.
+3. **Repo detection before init** — `restic init` is only called when the repo
+   is genuinely absent; transient errors are never mistaken for "missing repo".
+4. **Per-target failure tracking** — failures are collected from the parallel
+   jobs; the script reports a summary and exits non-zero if any target failed.
+5. **Lock retry + unlock-between-retries** — transient repo-lock collisions are
+   absorbed (`--retry-lock`) instead of failing the target.
+
+## Retention and Wasabi billing
+
+Defaults: `--keep-daily 30 --keep-weekly 4 --keep-monthly 3 --keep-within 30d`.
+
+`--keep-within 30d` guarantees no snapshot younger than 30 days is removed, so
+by the time the monthly `prune` deletes pack files they are past Wasabi's
+30-day minimum storage period (reserved capacity). **Pay-as-you-go accounts
+have a 90-day minimum** — raise retention accordingly or accept timed
+deleted-storage charges.
+
+`forget` (cheap, metadata-only) and `prune` (expensive, deletes/repacks data)
+are deliberately separate modes: forget nightly, prune monthly.
+
+## Interactive use over the rclone mount
+
+Keeping the rclone mounts for browsing/restores is fine — **reads are
+harmless**. Avoid restic *write* operations (backup/forget/prune) through the
+mount: any pack written via the mount goes through the tmp-rename path and
+generates deleted-storage charges. For pure queries, skip the repo lock
+entirely:
 
 ```bash
-restic -r /mnt/backup_pool/pool005/<user> --password-file /root/.backup_pass snapshots
-restic -r /mnt/backup_pool/pool005/<user> --password-file /root/.backup_pass restore latest --target /path/to/restore
+restic --no-lock -r /mnt/wasabi_backup_home/home3/alice snapshots
 ```
 
-> Directories named `restore*` in the source pool are excluded from backups.
+Set once in `/etc/profile.d/restic.sh` for convenience:
 
-## Notes and caveats
+```bash
+export RESTIC_PASSWORD_FILE=/root/.backup_pass
+export RESTIC_CACHE_DIR=/stage/backup/restic-cache
+```
 
-- Backup and forget do not reclaim data; ensure a `prune` schedule (`-p`) is in place or
-  repositories will grow indefinitely.
-- With the default `MAX_UNUSED=unlimited`, prune does not repack, so space is reclaimed
-  lazily (whole packs only). This is the safe/fast choice for large repos on object storage;
-  set `MAX_UNUSED=0` if you need to minimize stored size at the cost of repacking.
-- Prune locks each repository while it runs (per-repo; other users still back up). For very
-  large repos, use `MAX_REPACK_SIZE` to bound per-run work so prune fits your maintenance
-  window.
-- All repositories under a destination share one password file.
-- **rclone/s3fs mount + lock errors:** When the destination is an rclone (or s3fs) FUSE mount
-  of object storage (e.g. Wasabi), restic's local backend can intermittently fail on lock
-  files (`unable to refresh lock: chmod ...: no such file or directory`). This is caused by
-  the mount's directory cache surfacing a lock object that is already gone on the remote (or
-  leftovers from a killed run), not by repository corruption. The script's retry-with-unlock
-  wrapper absorbs these. To reduce them at the source, keep the mount's directory cache short
-  — for an rclone mount, add mount options such as
-  `dir_cache_time=5s,attr_timeout=1s,poll_interval=10s` (the default `dir_cache_time` is 5
-  minutes, which is the main culprit).
-- Per-user logs are overwritten each run; capture cron output (or copy logs) if you need
-  history for diagnosing intermittent failures.
-- `--compression` requires repositories in format v2; `--skip-if-unchanged` requires a
-  recent restic. `--max-unused`/`--max-repack-size` require restic ≥ 0.12.
+## Restore
+
+```bash
+# list snapshots for a user
+restic -r s3:https://s3.us-east-1.wasabisys.com/orcd-backup-home/home3/alice \
+    --password-file /root/.backup_pass snapshots
+
+# restore the latest snapshot
+restic -r s3:https://s3.us-east-1.wasabisys.com/orcd-backup-home/home3/alice \
+    --password-file /root/.backup_pass restore latest --target /home/restore/alice
+```
+
+## Logs
+
+Per-user logs are written to `$TMP/log/` (default `/db/temp/log/`) as
+`<bucket-component>-<root>_<user>-{backup,forget,prune,init}.log`. The script
+prints a failure summary and exits `1` if any target failed, `0` otherwise.
