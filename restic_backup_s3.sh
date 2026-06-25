@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Native S3-backend variant of restic_backup.sh: talks to Wasabi DIRECTLY via restic's
-# s3: backend instead of through the rclone VFS mount. This eliminates the temp-file
+# Native S3-backend variant of restic_backup.sh: talks to the object store DIRECTLY via
+# restic's s3: backend instead of through the rclone VFS mount. This eliminates the temp-file
 # write+rename of restic's local backend, which on an S3 mount becomes PUT+COPY+DELETE
 # and generates "deleted storage" charges roughly equal to every byte uploaded.
 # The s3 backend PUTs each object once under its final name: no renames, no VFS cache,
@@ -12,6 +12,17 @@
 # so this is a drop-in switch (both scripts must not run concurrently on the same repos;
 # they use different lock-file names, so rely on scheduling for that).
 #
+# CLOUD PROVIDERS: the script is vendor-agnostic via -c|--cloud (default: wasabi).
+#   -c wasabi : credentials/endpoint read from the [wasabi] section of rclone.conf
+#               (single source of truth with the mount); env vars override.
+#   -c aws    : nothing is read from rclone.conf. Credentials come from the standard
+#               AWS mechanisms restic understands natively (AWS_ACCESS_KEY_ID/
+#               AWS_SECRET_ACCESS_KEY, or AWS_PROFILE + ~/.aws/credentials); the
+#               endpoint is the regional AWS one derived from AWS_REGION/
+#               AWS_DEFAULT_REGION (default us-east-1). S3_ENDPOINT overrides.
+# Everything restic-side (backup, forget/keep retention, prune, locks, retry, cache)
+# is plain restic and behaves IDENTICALLY on both providers.
+#
 ## RUN example (backup): /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
 ## RUN example (forget): /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -f
 ## RUN example (prune) : /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -p
@@ -20,6 +31,8 @@
 ## RUN example (ad hoc while the scheduled run is in progress; bypasses the global lock,
 ##              takes per-user locks instead; only valid together with -u):
 ##                        /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -u alice -n -r
+## RUN example (AWS)    : AWS_PROFILE=backup AWS_REGION=us-east-1 \
+##                        /root/bin/restic_backup_s3.sh -c aws -s /home -b orcd-backup-home -R home3 -r
 ##
 ## -R is the REQUIRED root dir inside the bucket (the old mount-based equivalent of
 ##  -d /mnt/wasabi_backup_home/home3). It must already exist in the bucket (i.e. contain at
@@ -36,14 +49,19 @@ mkdir -p "${LOG}"
 
 cd "${TMP}" || exit 1
 
-# Wasabi with reserved capacity has a 30-day minimum storage period. Objects deleted before
-# 30 days are still billed for the full period and show as "deleted" in Wasabi's dashboard.
-# (Pay-as-you-go accounts have a 90-day minimum; if applicable, raise retention accordingly.)
-KEEP_DAILY=30
+# Retention (restic forget --keep-*). Provider-independent: identical snapshots are kept on
+# Wasabi and AWS. KEEP_WITHIN additionally protects every snapshot younger than that age.
+# Vendor billing note (does not change behavior, only why the defaults are what they are):
+#   Wasabi reserved capacity has a 30-day minimum storage period (pay-as-you-go: 90 days) —
+#   objects deleted earlier are still billed and show as "deleted storage";
+#   AWS S3 Standard has no minimum (S3-IA/Glacier classes do).
+KEEP_DAILY="${KEEP_DAILY:-7}"
 
-KEEP_WEEKLY=4
+KEEP_WEEKLY="${KEEP_WEEKLY:-1}"
 
-KEEP_MONTHLY=3
+KEEP_MONTHLY="${KEEP_MONTHLY:-0}"
+
+KEEP_WITHIN="${KEEP_WITHIN:-7d}"
 
 PASS_FILE="${PASS_FILE:-$HOME/.backup_pass}"
 
@@ -51,8 +69,15 @@ COMPRESSION="auto"
 
 SOURCE="/data2/pool/005"
 
-# Wasabi/S3 settings. Credentials and endpoint are read from the same rclone config the
-# mount uses, so there is a single source of truth for keys. Override any of these via env.
+# Cloud provider: wasabi (default) or aws. Also settable via -c|--cloud.
+CLOUD="${CLOUD:-wasabi}"
+
+# AWS region (cloud=aws only): used to derive the regional endpoint when S3_ENDPOINT is not
+# set, and exported for restic/rclone. AWS_DEFAULT_REGION is honored as a fallback.
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+
+# Wasabi settings (cloud=wasabi only). Credentials and endpoint are read from the same rclone
+# config the mount uses, so there is a single source of truth for keys. Override via env.
 RCLONE_CONF="${RCLONE_CONF:-/root/.config/rclone/rclone.conf}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-wasabi}"
 RCLONE_BIN="${RCLONE_BIN:-rclone}"      # used only to verify the root dir exists in the bucket
@@ -72,7 +97,7 @@ RESTIC="${RESTIC:-/usr/local/bin/restic}"
 #       orcd-backup-software -> /stage/backup/software/001/restic-cache).
 # Override explicitly with RESTIC_CACHE_DIR.
 
-MAX_JOBS="${MAX_JOBS:-90}"
+MAX_JOBS="${MAX_JOBS:-101}"
 
 # Pack size in MiB (restic >= 0.14). Larger packs = far fewer objects on Wasabi, which
 # reduces object churn, per-object overhead and "deleted storage" from lock/tmp turnover.
@@ -89,6 +114,18 @@ RETRY_LOCK="${RETRY_LOCK:-5m}"
 # (set e.g. 50G to chip away incrementally; empty = no cap). See restic docs "Customize pruning".
 MAX_UNUSED="${MAX_UNUSED:-unlimited}"
 MAX_REPACK_SIZE="${MAX_REPACK_SIZE:-}"
+
+# Small-pack repacking (restic >= 0.18 flag; restic >= 0.19 repacks small packs MORE
+# aggressively by default). This consolidation is INDEPENDENT of --max-unused, so on remote
+# object storage it adds download+re-upload (bandwidth + S3 request / Wasabi "deleted storage"
+# cost) to every prune even with --max-unused unlimited. Set REPACK_SMALLER_THAN to pin the
+# behavior explicitly instead of inheriting the (version-dependent) default:
+#   - a small value (e.g. 1B) effectively suppresses small-pack repacking -> cheapest prune,
+#     but small packs accumulate over time (more objects, more per-object overhead);
+#   - a larger value (e.g. 16M) consolidates more -> higher upfront prune cost, fewer objects.
+# Empty = inherit restic's default. Always confirm the repack volume with `prune --dry-run`
+# before settling on a value. See restic docs "Customize pruning".
+REPACK_SMALLER_THAN="${REPACK_SMALLER_THAN:-}"
 
 # Retry handling for transient network/S3 errors. RETRIES = additional attempts after the
 # first; RETRY_DELAY = seconds between them, with an unlock in between.
@@ -111,6 +148,10 @@ usage() {
     echo "Usage: $0 [options]"
     echo "Options:"
     echo "  -z <level>                  Set compression level (auto|off|fastest|better|max, default: auto)"
+    echo "  -c|--cloud <provider>       Cloud provider: wasabi|aws (default: ${CLOUD})"
+    echo "                              wasabi: keys/endpoint from rclone.conf [${RCLONE_REMOTE}] section"
+    echo "                              aws:    keys from AWS_PROFILE or AWS_ACCESS_KEY_ID/"
+    echo "                                      AWS_SECRET_ACCESS_KEY; endpoint from AWS_REGION"
     echo "  -s|--source <dir>           Set source directory to backup (default: ${SOURCE})"
     echo "  -b|--bucket <bucket[/pfx]>  Set destination bucket (and optional prefix) (default: ${BUCKET})"
     echo "  -R|--root-dir <dir>         REQUIRED: root dir inside the bucket (e.g. home3);"
@@ -128,17 +169,28 @@ usage() {
     echo "  Order when combined: backup -> forget -> prune."
     echo ""
     echo "Environment overrides:"
-    echo "  RCLONE_CONF       rclone config file holding the Wasabi keys (default: /root/.config/rclone/rclone.conf)"
-    echo "  RCLONE_REMOTE     rclone remote name to read keys/endpoint from (default: wasabi)"
-    echo "  S3_ENDPOINT       Wasabi endpoint URL (default: autodetected from rclone.conf)"
+    echo "  CLOUD             Same as -c (default: wasabi)"
+    echo "  RCLONE_CONF       [wasabi] rclone config file holding the keys (default: /root/.config/rclone/rclone.conf)"
+    echo "  RCLONE_REMOTE     [wasabi] rclone remote name to read keys/endpoint from (default: wasabi)"
+    echo "  AWS_PROFILE       [aws] profile in ~/.aws/credentials used by restic (env_auth)"
+    echo "  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+    echo "                    Explicit keys; override rclone.conf (wasabi) / AWS_PROFILE (aws)"
+    echo "  AWS_REGION        [aws] region for the endpoint (default: AWS_DEFAULT_REGION or us-east-1)"
+    echo "  S3_ENDPOINT       Endpoint URL (default: wasabi: from rclone.conf; aws: regional"
+    echo "                    https://s3.<region>.amazonaws.com). Set explicitly for other S3 vendors."
     echo "  S3_CONNECTIONS    restic -o s3.connections per process (default: 5)"
     echo "  RESTIC_CACHE_DIR  restic metadata cache (default: derived from bucket name,"
     echo "                    orcd-backup-<x> -> /stage/backup/<x>/001/restic-cache)"
-    echo "  MAX_JOBS          Parallel per-user jobs (default: 90)"
+    echo "  MAX_JOBS          Parallel per-user jobs (default: 101)"
     echo "  PACK_SIZE         Backup --pack-size in MiB (default: 64)"
     echo "  RETRY_LOCK        restic --retry-lock duration (default: 5m, restic >= 0.16)"
     echo "  MAX_UNUSED        Prune --max-unused value (default: unlimited = no repack, fastest)"
     echo "  MAX_REPACK_SIZE   Prune --max-repack-size value (default: unset = no cap)"
+    echo "  REPACK_SMALLER_THAN  Prune --repack-smaller-than value, e.g. 1B to suppress small-pack"
+    echo "                    repacking (restic >= 0.19 repacks small packs aggressively by default;"
+    echo "                    default: unset = inherit restic's default). Verify with prune --dry-run."
+    echo "  KEEP_DAILY/KEEP_WEEKLY/KEEP_MONTHLY/KEEP_WITHIN"
+    echo "                    Retention policy (defaults: 30/4/3/30d); identical on all providers"
     echo "  RETRIES           Extra attempts per target after the first (default: 2)"
     echo "  RETRY_DELAY       Seconds between attempts, with an unlock in between (default: 15)"
     echo "  ALLOW_NEW_ROOT=1  Bypass the root-dir-exists-in-bucket safety check (first run)"
@@ -149,6 +201,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -z|--compress)
             COMPRESSION="$2"
+            shift 2
+            ;;
+        -c|--cloud)
+            CLOUD="$2"
             shift 2
             ;;
         -s|--source)
@@ -193,6 +249,16 @@ if ! $RUN && ! $FORGET && ! $PRUNE; then
     usage
 fi
 
+# Normalize/validate the cloud provider.
+CLOUD="${CLOUD,,}"
+case "${CLOUD}" in
+    wasabi|aws) : ;;
+    *)
+        echo "ERROR: unsupported cloud provider '${CLOUD}' (supported: wasabi, aws)."
+        usage
+        ;;
+esac
+
 # Normalize and require the in-bucket root dir.
 ROOT_DIR="${ROOT_DIR#/}"; ROOT_DIR="${ROOT_DIR%/}"
 if [ -z "${ROOT_DIR}" ]; then
@@ -224,9 +290,15 @@ if [ ! -d "${SOURCE}" ]; then
     exit 1
 fi
 
-if [ ! -r "${RCLONE_CONF}" ]; then
-    echo "ERROR: rclone config '${RCLONE_CONF}' is missing or unreadable."
-    exit 1
+# rclone.conf is only the credential source for wasabi, and only when the keys are not
+# already supplied via environment. aws mode never touches rclone.conf.
+if [ "${CLOUD}" = "wasabi" ] && { [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; }; then
+    if [ ! -r "${RCLONE_CONF}" ]; then
+        echo "ERROR: rclone config '${RCLONE_CONF}' is missing or unreadable."
+        echo "       (Needed to read Wasabi keys/endpoint; or set AWS_ACCESS_KEY_ID,"
+        echo "       AWS_SECRET_ACCESS_KEY and S3_ENDPOINT explicitly.)"
+        exit 1
+    fi
 fi
 
 # Derive the restic cache dir from the bucket name: orcd-backup-<x> -> /stage/backup/<x>/001/restic-cache.
@@ -238,8 +310,9 @@ export RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/stage/backup/${COMPONENT}/001/rest
 mkdir -p "${RESTIC_CACHE_DIR}" || { echo "ERROR: cannot create cache dir ${RESTIC_CACHE_DIR}"; exit 1; }
 
 ############################################################################################
-# #1 Credentials/endpoint: read the [${RCLONE_REMOTE}] section of rclone.conf so the keys
-# live in exactly one place. restic's s3 backend takes them from the environment.
+# #1 Credentials/endpoint, per provider. restic's s3 backend takes everything from the
+# environment, so both branches end with the same contract: S3_ENDPOINT set, and either
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY exported or AWS_PROFILE left for restic to use.
 ############################################################################################
 rclone_conf_get() {
     # rclone_conf_get <key> -> value of "key = value" inside the [$RCLONE_REMOTE] section
@@ -250,23 +323,52 @@ rclone_conf_get() {
         }' "${RCLONE_CONF}"
 }
 
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-$(rclone_conf_get access_key_id)}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-$(rclone_conf_get secret_access_key)}"
+case "${CLOUD}" in
+    wasabi)
+        # Keys/endpoint from rclone.conf (single source of truth with the mount); env overrides.
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-$(rclone_conf_get access_key_id)}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-$(rclone_conf_get secret_access_key)}"
 
-if [ -z "${S3_ENDPOINT}" ]; then
-    S3_ENDPOINT="$(rclone_conf_get endpoint)"
-fi
-# Normalize: restic wants a URL; rclone.conf often stores a bare hostname.
+        if [ -z "${S3_ENDPOINT}" ]; then
+            S3_ENDPOINT="$(rclone_conf_get endpoint)"
+        fi
+
+        if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; then
+            echo "ERROR: could not determine S3 credentials/endpoint from '${RCLONE_CONF}' section [${RCLONE_REMOTE}]."
+            echo "       Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and S3_ENDPOINT explicitly."
+            exit 1
+        fi
+        ;;
+    aws)
+        # Standard AWS credential chain, handled by restic itself (and rclone env_auth for
+        # the root-dir check): explicit env keys win; otherwise AWS_PROFILE/~/.aws/credentials.
+        # Nothing is read from rclone.conf.
+        export AWS_REGION AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION}}"
+
+        if [ -z "${S3_ENDPOINT}" ]; then
+            S3_ENDPOINT="https://s3.${AWS_REGION}.amazonaws.com"
+        fi
+
+        if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            if [ -z "${AWS_PROFILE}" ]; then
+                echo "ERROR: no AWS credentials: set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY,"
+                echo "       or AWS_PROFILE pointing at a profile in ~/.aws/credentials."
+                exit 1
+            fi
+            if [ ! -r "${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}" ]; then
+                echo "ERROR: AWS_PROFILE='${AWS_PROFILE}' set but '${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}' is missing or unreadable."
+                exit 1
+            fi
+            export AWS_PROFILE
+        fi
+        ;;
+esac
+
+# Normalize: restic wants a URL; configs often store a bare hostname.
 case "${S3_ENDPOINT}" in
     http://*|https://*) : ;;
     *) S3_ENDPOINT="https://${S3_ENDPOINT}" ;;
 esac
-
-if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ] || [ -z "${S3_ENDPOINT#https://}" ]; then
-    echo "ERROR: could not determine S3 credentials/endpoint from '${RCLONE_CONF}' section [${RCLONE_REMOTE}]."
-    echo "       Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and S3_ENDPOINT explicitly."
-    exit 1
-fi
 
 # Repo prefix; per-user repo = ${REPO_PREFIX}/<user>. Identical object layout to the repos
 # previously reached through the rclone mount of the same bucket, e.g.
@@ -290,8 +392,17 @@ check_root_dir_exists() {
     fi
 
     local first
-    first=$("${RCLONE_BIN}" --config "${RCLONE_CONF}" lsf --max-depth 1 \
-            "${RCLONE_REMOTE}:${BUCKET%/}/${ROOT_DIR}" 2>/dev/null | head -n 1)
+    if [ "${CLOUD}" = "aws" ]; then
+        # On-the-fly rclone remote (no rclone.conf needed): env_auth picks up the same
+        # AWS env keys / AWS_PROFILE that restic uses. Endpoint given without scheme to
+        # keep the connection string free of ':' (which would require quoting).
+        first=$("${RCLONE_BIN}" lsf --max-depth 1 \
+                ":s3,provider=AWS,env_auth=true,region=${AWS_REGION},endpoint=${S3_ENDPOINT#*://}:${BUCKET%/}/${ROOT_DIR}" \
+                2>/dev/null | head -n 1)
+    else
+        first=$("${RCLONE_BIN}" --config "${RCLONE_CONF}" lsf --max-depth 1 \
+                "${RCLONE_REMOTE}:${BUCKET%/}/${ROOT_DIR}" 2>/dev/null | head -n 1)
+    fi
 
     if [ -z "${first}" ]; then
         echo "ERROR: root dir '${ROOT_DIR}' does not exist (or is empty) in bucket '${BUCKET}'."
@@ -373,7 +484,15 @@ ensure_repo() {
 }
 
 # Run a restic command with retries, clearing locks between attempts. This absorbs transient
-# network/S3 errors and leftover locks from killed runs.
+# network/S3 errors and leftover locks from killed runs (which surface as generic exit code 1).
+# Some exit codes are NOT transient and retrying only wastes an unlock+sleep per attempt, so
+# they fail fast (the failure is still reported by the caller). With restic >= 0.19 these are
+# reported distinctly (previously masked as exit 0):
+#   - backup exit 3 : a source path is missing/unreadable (incomplete snapshot); re-running
+#                     yields the same result, so do not retry (Fix #4467).
+#   - exit 130      : interrupted by SIGINT (Ctrl-C / shutdown); abort rather than retry (Fix #5258).
+# (forget exit 3, "failed to remove snapshots", CAN be a transient backend/lock issue, so it is
+#  still retried.)
 # --repo, --password-file, s3.connections and --retry-lock are appended automatically.
 # Usage: retry_restic <repo> <logfile> -- <restic args...>
 retry_restic() {
@@ -381,17 +500,28 @@ retry_restic() {
     local logfile="$2"
     shift 2
     [ "$1" = "--" ] && shift
+    local subcmd="$1"
 
     local attempt=1
     local max=$((RETRIES + 1))
+    local rc
     : > "${logfile}"
 
     while :; do
         if [ "${attempt}" -gt 1 ]; then
             printf '\n--- retry %d/%d ---\n' "$((attempt - 1))" "${RETRIES}" >> "${logfile}"
         fi
-        if "${RESTIC}" "$@" --repo "${repo}" --password-file "${PASS_FILE}" -o "s3.connections=${S3_CONNECTIONS}" --retry-lock "${RETRY_LOCK}" >> "${logfile}" 2>&1; then
+        "${RESTIC}" "$@" --repo "${repo}" --password-file "${PASS_FILE}" -o "s3.connections=${S3_CONNECTIONS}" --retry-lock "${RETRY_LOCK}" >> "${logfile}" 2>&1
+        rc=$?
+        if [ "${rc}" -eq 0 ]; then
             return 0
+        fi
+
+        # Non-transient exit codes: retrying cannot help, so fail fast.
+        if [ "${rc}" -eq 130 ] || { [ "${subcmd}" = "backup" ] && [ "${rc}" -eq 3 ]; }; then
+            echo "  not retrying ${subcmd} for repo ${repo}: exit ${rc} is non-transient (see ${logfile})"
+            echo "  not retrying ${subcmd}: exit ${rc} is non-transient" >> "${logfile}"
+            return "${rc}"
         fi
 
         if [ "${attempt}" -ge "${max}" ]; then
@@ -443,10 +573,11 @@ backup_user() {
 forget_user() {
     local USER="$1"
     local REPO="${REPO_PREFIX}/${USER}"
-    # --keep-within 30d ensures no snapshot younger than 30 days is ever removed,
-    # preventing pack files from being eligible for prune before Wasabi's minimum storage period
-    # (30 days under reserved capacity).
-    local FORGET_OPTS="--keep-daily ${KEEP_DAILY} --keep-weekly ${KEEP_WEEKLY} --keep-monthly ${KEEP_MONTHLY} --keep-within 30d --group-by paths --compact"
+    # --keep-within ${KEEP_WITHIN} ensures no snapshot younger than that is ever removed.
+    # Identical on every provider; the default (30d) is sized so packs cannot become eligible
+    # for prune before Wasabi's reserved-capacity minimum storage period. On AWS S3 Standard
+    # it is simply extra snapshot safety with no billing significance.
+    local FORGET_OPTS="--keep-daily ${KEEP_DAILY} --keep-weekly ${KEEP_WEEKLY} --keep-monthly ${KEEP_MONTHLY} --keep-within ${KEEP_WITHIN} --group-by paths --compact"
 
     if ! "${RESTIC}" cat config --repo "${REPO}" --password-file "${PASS_FILE}" -o "s3.connections=${S3_CONNECTIONS}" > /dev/null 2>&1; then
         echo "Skipping forget for ${USER}: repository not found at ${REPO}"
@@ -477,13 +608,16 @@ prune_user() {
     if [ -n "${MAX_REPACK_SIZE}" ]; then
         PRUNE_OPTS="${PRUNE_OPTS} --max-repack-size ${MAX_REPACK_SIZE}"
     fi
+    if [ -n "${REPACK_SMALLER_THAN}" ]; then
+        PRUNE_OPTS="${PRUNE_OPTS} --repack-smaller-than ${REPACK_SMALLER_THAN}"
+    fi
 
     if ! "${RESTIC}" cat config --repo "${REPO}" --password-file "${PASS_FILE}" -o "s3.connections=${S3_CONNECTIONS}" > /dev/null 2>&1; then
         echo "Skipping prune for ${USER}: repository not found at ${REPO}"
         return 0
     fi
 
-    echo "Starting prune for user: ${USER} (max-unused=${MAX_UNUSED}${MAX_REPACK_SIZE:+, max-repack-size=${MAX_REPACK_SIZE}})"
+    echo "Starting prune for user: ${USER} (max-unused=${MAX_UNUSED}${MAX_REPACK_SIZE:+, max-repack-size=${MAX_REPACK_SIZE}}${REPACK_SMALLER_THAN:+, repack-smaller-than=${REPACK_SMALLER_THAN}})"
 
     if ! retry_restic "${REPO}" "${LOG}/${SFX}_${USER}-prune.log" -- prune ${PRUNE_OPTS}; then
         echo "Prune failed for ${SFX} : ${USER}. Check ${LOG}/${SFX}_${USER}-prune.log"

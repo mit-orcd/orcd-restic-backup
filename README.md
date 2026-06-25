@@ -36,7 +36,9 @@ dir-cache lock flakiness of the mount.
 ## Requirements
 
 - bash >= 4.3, `flock`, GNU `find`
-- restic >= 0.17 (`--retry-lock`, `--skip-if-unchanged`)
+- restic >= 0.17 (`--retry-lock`, `--skip-if-unchanged`); tested with 0.19.
+  `REPACK_SMALLER_THAN` requires restic >= 0.18; on 0.19 the exit-code-aware retry
+  logic relies on `backup` exit 3 / SIGINT exit 130 being reported distinctly.
 - rclone (only to verify the in-bucket root dir, and for the legacy script's mount)
 - Wasabi credentials in `/root/.config/rclone/rclone.conf`, e.g.:
 
@@ -107,8 +109,9 @@ ALLOW_NEW_ROOT=1 restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
 | `PACK_SIZE` | `64` | `--pack-size` (MiB); larger packs = fewer objects on Wasabi |
 | `RETRY_LOCK` | `5m` | restic `--retry-lock`: wait for competing repo locks |
 | `RETRIES` / `RETRY_DELAY` | `2` / `15` | Extra attempts per target / seconds between them |
-| `MAX_UNUSED` | `unlimited` | Prune `--max-unused` (`unlimited` = never repack, fastest) |
+| `MAX_UNUSED` | `unlimited` | Prune `--max-unused` (`unlimited` = no unused-space repack, fastest) |
 | `MAX_REPACK_SIZE` | unset | Prune `--max-repack-size` cap per run |
+| `REPACK_SMALLER_THAN` | unset | Prune `--repack-smaller-than` (e.g. `1B` to suppress small-pack repacking; see note below) |
 | `S3_CONNECTIONS` | `5` | restic `-o s3.connections` per process |
 | `S3_ENDPOINT` | from rclone.conf | Wasabi endpoint URL |
 | `RCLONE_CONF` | `/root/.config/rclone/rclone.conf` | Where keys/endpoint are read from |
@@ -141,7 +144,9 @@ The restic metadata cache is derived from the bucket name —
 4. **Per-target failure tracking** — failures are collected from the parallel
    jobs; the script reports a summary and exits non-zero if any target failed.
 5. **Lock retry + unlock-between-retries** — transient repo-lock collisions are
-   absorbed (`--retry-lock`) instead of failing the target.
+   absorbed (`--retry-lock`) instead of failing the target. Non-transient failures
+   (`backup` exit 3 = missing/unreadable source path; exit 130 = SIGINT) fail fast
+   without burning retries; they are still reported in the failure summary.
 
 ## Retention and Wasabi billing
 
@@ -155,6 +160,15 @@ deleted-storage charges.
 
 `forget` (cheap, metadata-only) and `prune` (expensive, deletes/repacks data)
 are deliberately separate modes: forget nightly, prune monthly.
+
+**restic >= 0.19 small-pack repacking:** restic 0.19 repacks small pack files more
+aggressively *by default*. This consolidation is independent of `--max-unused`, so
+even with `MAX_UNUSED=unlimited` a prune downloads + re-uploads more small packs than
+on 0.17/0.18 — extra bandwidth and S3/Wasabi request + deleted-storage cost on every
+prune. Set `REPACK_SMALLER_THAN` to pin the behavior: a small value (e.g. `1B`)
+suppresses small-pack repacking (cheapest prune, but small packs accumulate over time);
+a larger value consolidates more (higher upfront cost, fewer objects). Always confirm
+the repack volume with `restic prune --dry-run` before settling on a value.
 
 ## Interactive use over the rclone mount
 
