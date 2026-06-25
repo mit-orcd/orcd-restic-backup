@@ -12,7 +12,7 @@
 # so this is a drop-in switch (both scripts must not run concurrently on the same repos;
 # they use different lock-file names, so rely on scheduling for that).
 #
-# CLOUD PROVIDERS: the script is vendor-agnostic via -c|--cloud (default: wasabi).
+# CLOUD PROVIDERS: the script is vendor-agnostic via -c|--cloud (default: aws).
 #   -c wasabi : credentials/endpoint read from the [wasabi] section of rclone.conf
 #               (single source of truth with the mount); env vars override.
 #   -c aws    : nothing is read from rclone.conf. Credentials come from the standard
@@ -31,8 +31,13 @@
 ## RUN example (ad hoc while the scheduled run is in progress; bypasses the global lock,
 ##              takes per-user locks instead; only valid together with -u):
 ##                        /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -u alice -n -r
-## RUN example (AWS)    : AWS_PROFILE=backup AWS_REGION=us-east-1 \
-##                        /root/bin/restic_backup_s3.sh -c aws -s /home -b orcd-backup-home -R home3 -r
+##
+## The provider defaults to aws, so the examples above need AWS credentials in the
+## environment (AWS_PROFILE, or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) and AWS_REGION
+## set to the bucket's region, e.g.:
+##                        AWS_PROFILE=backup AWS_REGION=us-east-1 \
+##                        /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
+## RUN example (Wasabi) : /root/bin/restic_backup_s3.sh -c wasabi -s /home -b orcd-backup-home -R home3 -r
 ##
 ## -R is the REQUIRED root dir inside the bucket (the old mount-based equivalent of
 ##  -d /mnt/wasabi_backup_home/home3). It must already exist in the bucket (i.e. contain at
@@ -69,8 +74,8 @@ COMPRESSION="auto"
 
 SOURCE="/data2/pool/005"
 
-# Cloud provider: wasabi (default) or aws. Also settable via -c|--cloud.
-CLOUD="${CLOUD:-wasabi}"
+# Cloud provider: aws (default) or wasabi. Also settable via -c|--cloud.
+CLOUD="${CLOUD:-aws}"
 
 # AWS region (cloud=aws only): used to derive the regional endpoint when S3_ENDPOINT is not
 # set, and exported for restic/rclone. AWS_DEFAULT_REGION is honored as a fallback.
@@ -148,10 +153,10 @@ usage() {
     echo "Usage: $0 [options]"
     echo "Options:"
     echo "  -z <level>                  Set compression level (auto|off|fastest|better|max, default: auto)"
-    echo "  -c|--cloud <provider>       Cloud provider: wasabi|aws (default: ${CLOUD})"
-    echo "                              wasabi: keys/endpoint from rclone.conf [${RCLONE_REMOTE}] section"
+    echo "  -c|--cloud <provider>       Cloud provider: aws|wasabi (default: ${CLOUD})"
     echo "                              aws:    keys from AWS_PROFILE or AWS_ACCESS_KEY_ID/"
     echo "                                      AWS_SECRET_ACCESS_KEY; endpoint from AWS_REGION"
+    echo "                              wasabi: keys/endpoint from rclone.conf [${RCLONE_REMOTE}] section"
     echo "  -s|--source <dir>           Set source directory to backup (default: ${SOURCE})"
     echo "  -b|--bucket <bucket[/pfx]>  Set destination bucket (and optional prefix) (default: ${BUCKET})"
     echo "  -R|--root-dir <dir>         REQUIRED: root dir inside the bucket (e.g. home3);"
@@ -169,7 +174,7 @@ usage() {
     echo "  Order when combined: backup -> forget -> prune."
     echo ""
     echo "Environment overrides:"
-    echo "  CLOUD             Same as -c (default: wasabi)"
+    echo "  CLOUD             Same as -c (default: aws)"
     echo "  RCLONE_CONF       [wasabi] rclone config file holding the keys (default: /root/.config/rclone/rclone.conf)"
     echo "  RCLONE_REMOTE     [wasabi] rclone remote name to read keys/endpoint from (default: wasabi)"
     echo "  AWS_PROFILE       [aws] profile in ~/.aws/credentials used by restic (env_auth)"

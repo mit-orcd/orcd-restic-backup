@@ -1,25 +1,32 @@
 # orcd-restic
 
 Parallel, per-user [restic](https://restic.net/) backups of large multi-user
-filesystems to Wasabi S3 buckets.
+filesystems to **AWS S3** (or, occasionally, Wasabi) buckets.
 
 Each top-level directory under the source (typically one per user) is backed up
 into its **own restic repository** inside the bucket, so users can be backed up,
 expired, pruned, and restored independently and in parallel.
 
 ```text
-SOURCE                    BUCKET (Wasabi)
+SOURCE                    BUCKET (AWS S3 / Wasabi)
 /home/alice      ->       s3://orcd-backup-home/home3/alice    (restic repo)
 /home/bob        ->       s3://orcd-backup-home/home3/bob      (restic repo)
 /home/carol      ->       s3://orcd-backup-home/home3/carol    (restic repo)
 ```
 
-## Scripts
+## The script
 
-| Script | Backend | Status |
-| --- | --- | --- |
-| `restic_backup_s3.sh` | restic native S3 backend, talks directly to Wasabi | **recommended** |
-| `restic_backup.sh` | restic local backend over an rclone VFS mount | legacy |
+`restic_backup_s3.sh` uses restic's **native S3 backend**, talking directly to
+the object store. It is vendor-agnostic via `-c|--cloud`:
+
+- `-c aws` **(default)** — credentials from the standard AWS chain
+  (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `AWS_PROFILE`); endpoint derived
+  from `AWS_REGION`.
+- `-c wasabi` — keys/endpoint from the `[wasabi]` section of `rclone.conf`. Wasabi
+  is used only sporadically and is not the primary target.
+
+Everything restic-side (backup, retention, prune, locks, retry, cache) is
+identical on both providers; only credential/endpoint resolution differs.
 
 ### Why the native S3 backend?
 
@@ -36,11 +43,23 @@ dir-cache lock flakiness of the mount.
 ## Requirements
 
 - bash >= 4.3, `flock`, GNU `find`
-- restic >= 0.17 (`--retry-lock`, `--skip-if-unchanged`); tested with 0.19.
-  `REPACK_SMALLER_THAN` requires restic >= 0.18; on 0.19 the exit-code-aware retry
-  logic relies on `backup` exit 3 / SIGINT exit 130 being reported distinctly.
-- rclone (only to verify the in-bucket root dir, and for the legacy script's mount)
-- Wasabi credentials in `/root/.config/rclone/rclone.conf`, e.g.:
+- restic >= 0.17 (`--retry-lock`, `--skip-if-unchanged`); **tested with 0.19**.
+  `REPACK_SMALLER_THAN` requires restic >= 0.18; the exit-code-aware retry logic
+  relies on restic >= 0.19 reporting `backup` exit 3 / SIGINT exit 130 distinctly.
+- rclone — used only to verify the in-bucket root dir exists before a run.
+
+### Credentials
+
+**`-c aws` (default)** — nothing is read from rclone.conf. Credentials come from
+the standard AWS chain restic understands natively: `AWS_ACCESS_KEY_ID` +
+`AWS_SECRET_ACCESS_KEY`, or `AWS_PROFILE` + `~/.aws/credentials`. The endpoint is
+the regional AWS one derived from `AWS_REGION` (default `us-east-1`) — **set
+`AWS_REGION` to the bucket's actual region** (or override `S3_ENDPOINT`), or the
+run fails the root-dir check against the wrong regional endpoint.
+
+**`-c wasabi`** (sporadic use) — keys and endpoint are read from
+`/root/.config/rclone/rclone.conf` (single source of truth with the mount); no
+separate AWS config is needed:
 
 ```ini
 [wasabi]
@@ -51,15 +70,13 @@ secret_access_key = ...
 endpoint = s3.us-east-1.wasabisys.com
 ```
 
-`restic_backup_s3.sh` reads the keys and endpoint from this file (single source
-of truth); no separate AWS config is needed.
-
 ## Usage
 
 ```text
 restic_backup_s3.sh [options]
 
   -z <level>                  Compression level (auto|off|fastest|better|max, default: auto)
+  -c|--cloud <provider>       Cloud provider: aws|wasabi (default: aws)
   -s|--source <dir>           Source directory containing per-user dirs
   -b|--bucket <bucket[/pfx]>  Destination bucket (default: orcd-backup-home)
   -R|--root-dir <dir>         REQUIRED root dir inside the bucket (e.g. home3);
@@ -76,11 +93,17 @@ restic_backup_s3.sh [options]
 ### Examples
 
 ```bash
-# Nightly: backup + retention for all users
-restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r -f
+# Nightly: backup + retention for all users (AWS S3, the default;
+# creds via AWS_PROFILE or AWS_ACCESS_KEY_ID/SECRET, AWS_REGION = bucket region)
+AWS_PROFILE=backup AWS_REGION=us-east-1 \
+  restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r -f
 
-# Monthly: reclaim space (respect Wasabi minimum storage period)
-restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -p
+# Against Wasabi instead (keys read from rclone.conf [wasabi])
+restic_backup_s3.sh -c wasabi -s /home -b orcd-backup-home -R home3 -r -f
+
+# Monthly: reclaim unreferenced data (on Wasabi, run no more often than the storage minimum)
+AWS_PROFILE=backup AWS_REGION=us-east-1 \
+  restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -p
 
 # Ad hoc, one user only
 restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -u alice -r -f
@@ -95,6 +118,10 @@ ALLOW_NEW_ROOT=1 restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
 ### Suggested cron schedule
 
 ```cron
+# AWS credentials must be present in the cron environment (default provider is aws):
+AWS_PROFILE=backup
+AWS_REGION=us-east-1
+
 # nightly backup + forget at 04:00
 0 4 * * *  /root/bin/restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r -f >> /var/log/restic_backup.log 2>&1
 # monthly prune, 1st of the month at 12:00
@@ -105,17 +132,22 @@ ALLOW_NEW_ROOT=1 restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -r
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MAX_JOBS` | `90` | Parallel per-user jobs |
-| `PACK_SIZE` | `64` | `--pack-size` (MiB); larger packs = fewer objects on Wasabi |
+| `CLOUD` | `aws` | Provider (same as `-c`): `aws` or `wasabi` |
+| `MAX_JOBS` | `101` | Parallel per-user jobs |
+| `PACK_SIZE` | `64` | `--pack-size` (MiB); larger packs = fewer objects |
+| `KEEP_DAILY` / `KEEP_WEEKLY` / `KEEP_MONTHLY` / `KEEP_WITHIN` | `7` / `1` / `0` / `7d` | Retention policy (see below) |
 | `RETRY_LOCK` | `5m` | restic `--retry-lock`: wait for competing repo locks |
 | `RETRIES` / `RETRY_DELAY` | `2` / `15` | Extra attempts per target / seconds between them |
 | `MAX_UNUSED` | `unlimited` | Prune `--max-unused` (`unlimited` = no unused-space repack, fastest) |
 | `MAX_REPACK_SIZE` | unset | Prune `--max-repack-size` cap per run |
-| `REPACK_SMALLER_THAN` | unset | Prune `--repack-smaller-than` (e.g. `1B` to suppress small-pack repacking; see note below) |
+| `REPACK_SMALLER_THAN` | unset | Prune `--repack-smaller-than` (e.g. `1B` to suppress small-pack repacking; see below) |
 | `S3_CONNECTIONS` | `5` | restic `-o s3.connections` per process |
-| `S3_ENDPOINT` | from rclone.conf | Wasabi endpoint URL |
-| `RCLONE_CONF` | `/root/.config/rclone/rclone.conf` | Where keys/endpoint are read from |
-| `RCLONE_REMOTE` | `wasabi` | rclone.conf section to read |
+| `S3_ENDPOINT` | provider default | Endpoint URL (wasabi: from rclone.conf; aws: `https://s3.<region>.amazonaws.com`) |
+| `RCLONE_CONF` | `/root/.config/rclone/rclone.conf` | `[wasabi]` keys/endpoint source |
+| `RCLONE_REMOTE` | `wasabi` | rclone.conf section to read (wasabi mode) |
+| `AWS_REGION` | `us-east-1` | aws mode: region for the endpoint (or `AWS_DEFAULT_REGION`) |
+| `AWS_PROFILE` | unset | aws mode: profile in `~/.aws/credentials` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | Explicit keys (override rclone.conf / `AWS_PROFILE`) |
 | `RESTIC_CACHE_DIR` | derived | restic metadata cache (see below) |
 | `PASS_FILE` | `~/.backup_pass` | restic repository password file |
 | `TMP` | `/db/temp` | Lock files, failure log, per-user logs (`$TMP/log/`) |
@@ -143,32 +175,44 @@ The restic metadata cache is derived from the bucket name —
    is genuinely absent; transient errors are never mistaken for "missing repo".
 4. **Per-target failure tracking** — failures are collected from the parallel
    jobs; the script reports a summary and exits non-zero if any target failed.
-5. **Lock retry + unlock-between-retries** — transient repo-lock collisions are
-   absorbed (`--retry-lock`) instead of failing the target. Non-transient failures
-   (`backup` exit 3 = missing/unreadable source path; exit 130 = SIGINT) fail fast
-   without burning retries; they are still reported in the failure summary.
+5. **Lock retry + unlock-between-retries** — transient repo-lock collisions and
+   network/S3 errors are absorbed (`--retry-lock` plus an unlock + retry).
+   Non-transient failures fail fast instead of wasting retries: `backup` exit 3
+   (missing/unreadable source) and exit 130 (SIGINT) are not retried — but are
+   still recorded in the failure summary. (`forget` exit 3 is still retried, as it
+   can be a transient lock/backend issue.)
 
-## Retention and Wasabi billing
+## Retention, pruning, and billing
 
-Defaults: `--keep-daily 30 --keep-weekly 4 --keep-monthly 3 --keep-within 30d`.
+Default policy (all env-overridable):
+`--keep-daily 7 --keep-weekly 1 --keep-monthly 0 --keep-within 7d`.
 
-`--keep-within 30d` guarantees no snapshot younger than 30 days is removed, so
-by the time the monthly `prune` deletes pack files they are past Wasabi's
-30-day minimum storage period (reserved capacity). **Pay-as-you-go accounts
-have a 90-day minimum** — raise retention accordingly or accept timed
-deleted-storage charges.
+These defaults are tuned for **AWS S3 Standard**, which has no minimum storage
+period, so shorter retention directly lowers stored GB-months.
+
+**On Wasabi, raise `KEEP_WITHIN` to at least the minimum storage period** (30
+days for reserved capacity, 90 for pay-as-you-go). Otherwise the monthly `prune`
+deletes pack files younger than that minimum and they are billed as *timed
+deleted storage*. A Wasabi-appropriate policy, for example:
+
+```bash
+KEEP_DAILY=30 KEEP_WEEKLY=4 KEEP_MONTHLY=3 KEEP_WITHIN=30d \
+  restic_backup_s3.sh -s /home -b orcd-backup-home -R home3 -f
+```
 
 `forget` (cheap, metadata-only) and `prune` (expensive, deletes/repacks data)
 are deliberately separate modes: forget nightly, prune monthly.
 
-**restic >= 0.19 small-pack repacking:** restic 0.19 repacks small pack files more
-aggressively *by default*. This consolidation is independent of `--max-unused`, so
-even with `MAX_UNUSED=unlimited` a prune downloads + re-uploads more small packs than
-on 0.17/0.18 — extra bandwidth and S3/Wasabi request + deleted-storage cost on every
-prune. Set `REPACK_SMALLER_THAN` to pin the behavior: a small value (e.g. `1B`)
-suppresses small-pack repacking (cheapest prune, but small packs accumulate over time);
-a larger value consolidates more (higher upfront cost, fewer objects). Always confirm
-the repack volume with `restic prune --dry-run` before settling on a value.
+### Small-pack repacking (restic >= 0.19)
+
+restic 0.19 repacks small pack files more aggressively *by default*. This
+consolidation is independent of `--max-unused`, so even with
+`MAX_UNUSED=unlimited` a prune downloads + re-uploads more small packs than on
+0.17/0.18 — extra bandwidth and S3 request / Wasabi deleted-storage cost on every
+prune. Set `REPACK_SMALLER_THAN` to pin it: a small value (e.g. `1B`) suppresses
+small-pack repacking (cheapest prune, but small packs accumulate over time); a
+larger value (e.g. `16M`) consolidates more (higher upfront cost, fewer objects).
+Confirm the repack volume with `restic prune --dry-run` before settling on a value.
 
 ## Interactive use over the rclone mount
 
@@ -200,6 +244,10 @@ restic -r s3:https://s3.us-east-1.wasabisys.com/orcd-backup-home/home3/alice \
 restic -r s3:https://s3.us-east-1.wasabisys.com/orcd-backup-home/home3/alice \
     --password-file /root/.backup_pass restore latest --target /home/restore/alice
 ```
+
+For an **AWS** repo, use the regional endpoint and AWS credentials instead, e.g.
+`-r s3:https://s3.us-east-1.amazonaws.com/orcd-backup-home/home3/alice` with
+`AWS_PROFILE`/`AWS_ACCESS_KEY_ID` exported.
 
 ## Logs
 
