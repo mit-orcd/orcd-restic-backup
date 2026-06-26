@@ -28,6 +28,10 @@ the object store. It is vendor-agnostic via `-c|--cloud`:
 Everything restic-side (backup, retention, prune, locks, retry, cache) is
 identical on both providers; only credential/endpoint resolution differs.
 
+A companion script, **`restic_repair.sh`**, fixes repos that fail prune with
+missing-pack / "index is not complete" errors — see
+[Repairing damaged repositories](#repairing-damaged-repositories).
+
 ### Why the native S3 backend?
 
 restic's *local* backend writes every pack file under a temporary name
@@ -213,6 +217,69 @@ prune. Set `REPACK_SMALLER_THAN` to pin it: a small value (e.g. `1B`) suppresses
 small-pack repacking (cheapest prune, but small packs accumulate over time); a
 larger value (e.g. `16M`) consolidates more (higher upfront cost, fewer objects).
 Confirm the repack volume with `restic prune --dry-run` before settling on a value.
+
+## Repairing damaged repositories
+
+A prune may abort on a repo whose index references pack files missing from the
+bucket (typically fallout from the old rclone-mount era):
+
+```text
+The index references 1 needed pack files which are missing from the repository: ...
+Fatal: packs from index missing in repo
+... or ...
+Integrity check failed: Data seems to be missing.
+Fatal: index is not complete
+```
+
+`restic_backup_s3.sh -p` reports each such repo as a prune failure (and writes the
+detail to `$TMP/log/<sfx>_<user>-prune.log`). The companion **`restic_repair.sh`**
+fixes them. It resolves credentials/endpoint/repo URLs exactly like the backup
+script (same `-c`/`-b`/`-R` and AWS/Wasabi handling) and runs a **check-gated**
+routine per repo, so a healthy repo is never modified:
+
+```text
+unlock → check ─healthy→ (prune)
+             └─damaged→ repair index → check ─healthy→ (prune)
+                                          └─still damaged→ repair snapshots --forget → check → prune
+```
+
+> **`repair snapshots --forget` is destructive:** for repos still damaged after the
+> index rebuild it rewrites the affected snapshots *without* the missing files and
+> forgets the originals. That file content is gone from history; the next backup
+> re-captures it from the live filesystem. Use `--dry-run` to preview first.
+
+### Target selection
+
+- **Default** — auto-discovers the failed repos by scanning the prune logs for the
+  integrity signatures above (no manual list needed).
+- `-u <name>` (repeatable) or `-L <file>` — an explicit list.
+- `--save-list <file>` — write the discovered names and exit without changes
+  (capture now, repair later).
+
+### Examples
+
+```bash
+# Run right after a prune — repairs whatever just failed (auto-discovered)
+AWS_PROFILE=orcd AWS_REGION=us-east-2 restic_repair.sh -c aws -b orcd-backup-home -R home3
+
+# Preview only — no changes (shows `repair snapshots --dry-run`)
+restic_repair.sh -c aws -b orcd-backup-home -R home3 --dry-run
+
+# Capture the failed list now, repair from it later
+restic_repair.sh -c aws -b orcd-backup-home -R home3 --save-list /root/repair.queue
+restic_repair.sh -c aws -b orcd-backup-home -R home3 -L /root/repair.queue
+```
+
+Other flags: `--no-snapshot-repair` (unlock + `repair index` only), `--no-prune`
+(fix integrity, skip the final prune). `MAX_JOBS` defaults to `8` (repair is heavier
+than backup). Per-repo logs go to `$TMP/log/<sfx>_<user>-repair.log`.
+
+### Suggested schedule (prune, then repair)
+
+```cron
+0 12 1 * * AWS_PROFILE=orcd AWS_REGION=us-east-2 /root/bin/restic_backup_s3.sh -c aws -b orcd-backup-home -R home3 -p >> /var/log/restic_prune.log  2>&1
+0 20 1 * * AWS_PROFILE=orcd AWS_REGION=us-east-2 /root/bin/restic_repair.sh    -c aws -b orcd-backup-home -R home3    >> /var/log/restic_repair.log 2>&1
+```
 
 ## Interactive use over the rclone mount
 
