@@ -14,6 +14,15 @@ SOURCE                    BUCKET (AWS S3 / Wasabi)
 /home/carol      ->       s3://orcd-backup-home/home3/carol    (restic repo)
 ```
 
+## Companion: restore UI
+
+The **[orcd-restic-console](https://github.com/mit-orcd/orcd-restic-console)** repo
+(production branch `xfer`) is the read/restore side of this system: a Flask web UI for
+browsing snapshots and restoring files from the per-user repositories this script creates.
+The two share the same conventions — restic version, password file (`/root/.backup_pass`),
+the `s3://<bucket>/<root>/<user>` repo layout, and `/stage` for fast metadata cache.
+This repo *writes and maintains* the repositories; the console *reads and restores* them.
+
 ## The script
 
 `restic_backup_s3.sh` uses restic's **native S3 backend**, talking directly to
